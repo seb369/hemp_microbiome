@@ -1,0 +1,1475 @@
+---
+title: "Hemp microbiome analysis"
+author: "Samuel Barnett"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 2
+---
+
+
+## Introduction
+
+Here we will be running the analysis for the hemp core microbiome project. Anka hemp plants were grown in 6 fields around Ithaca and Geneva NY. We collected bulk soil, rhizosphere soil, root tissue, leaf washes, and flower washes from 5 plants per field. We extracted DNA from these samples and amplified and sequenced the V4 region of the 16S rRNA gene (bacterial community) as well as the ITS1 region (fungal community). The goal of this study is to identify members of the core microbiome of hemp.
+
+### Calling packages
+```{r, message=FALSE, warning=FALSE}
+# Packages needed for data handeling
+library(dplyr)
+library(tibble)
+library(tidyr)
+library(phyloseq)
+library(kableExtra)
+library(multcomp)
+
+# Packages needed for analysis
+library(vegan)
+library(DESeq2)
+library(ape)
+library(knitr)
+library(agricolae)
+
+# Packages needed for plotting
+library(ggplot2)
+
+# Setting seed similar to R versions < 3.6
+RNGkind(sample.kind = "Rounding")
+```
+
+### Importing data
+All data is combined in phyloseq objects. First we need to do a bit of filtering
+```{r, message=FALSE, warning=FALSE}
+
+# Import field data including crop yield
+field.data = read.table("/home/sam/notebooks/hemp_microbiome/data/hemp_field_data.txt", stringsAsFactors = F, sep="\t", header=T)
+
+# Import bacterial/archeal phyloseq object created in the sequence analysis pipeline
+physeq = readRDS("/home/sam/notebooks/hemp_microbiome/data/16S_OTUs/physeq.hemp16S.rds")
+
+# Get the metadata table for later use
+metadata = data.frame(sample_data(physeq), stringsAsFactors = F)
+
+# Extract just OTUs classified as bacteria
+physeq16S.bact = subset_taxa(physeq, Rank1=="D_0__Bacteria")
+physeq = NULL # Removing the original phyloseq to save memory
+
+# I'll also import the phylogenetic tree for the bacterial OTUs and add it to the bacterial phyloseq object
+bact.tree = read.tree("/home/sam/notebooks/hemp_microbiome/data/16S_OTUs/hemp.bact.tre")
+phy_tree(physeq16S.bact) = bact.tree
+
+# Import the fungal phyloseq object
+physeqITS.fungi = readRDS("/home/sam/notebooks/hemp_microbiome/data/ITS_OTUs/physeq.hempITS.rds")
+
+# Remove any OTUs not classified as Fungi
+physeqITS.fungi = subset_taxa(physeqITS.fungi, Kingdom == "Fungi")
+
+
+# Remove unsequenced samples. These were samples that were not sequenced due to low PCR product. They were originally left in the metadata file for simplicity sake.
+physeq16S.bact = subset_samples(physeq16S.bact, Sequenced_16S == "TRUE")
+physeq16S.bact = prune_taxa(taxa_sums(physeq16S.bact) > 0, physeq16S.bact)
+physeqITS.fungi = subset_samples(physeqITS.fungi, Sequenced_ITS == "TRUE")
+physeqITS.fungi = prune_taxa(taxa_sums(physeqITS.fungi) > 0, physeqITS.fungi)
+
+# Remove sample F5-1 because it does not look right. In the ordination using flowers, it falls way far away. This is probably due to contamination.
+physeq16S.bact = subset_samples(physeq16S.bact, sample_ID != "F5-1")
+
+```
+
+Now remove any samples that are poorly sequenced (<2000 reads for bacteria and <1000 reads for fungi).
+```{r, message=FALSE, warning=FALSE}
+## Find samples that have OTU totals greater than a threshold (2000 for bacteria and 1000 for fungi) and subset only these
+physeq16S.bact = prune_samples(sample_sums(physeq16S.bact) >= 2000, physeq16S.bact)
+physeq16S.bact = prune_taxa(taxa_sums(physeq16S.bact) > 0, physeq16S.bact)
+
+physeqITS.fungi = prune_samples(sample_sums(physeqITS.fungi) >= 1000, physeqITS.fungi)
+physeqITS.fungi = prune_taxa(taxa_sums(physeqITS.fungi) > 0, physeqITS.fungi)
+
+
+```
+
+Also need to remove some extra sample types that were not used in this analysis and root tissues from the fungal dataset because they were primarily hemp ITS sequences.
+```{r, message=FALSE, warning=FALSE}
+## Remove the Male/Female flower samples. Also remove the root tissue samples from the fungal dataset since these were overrun with hemp ITS sequences.
+physeq16S.bact = subset_samples(physeq16S.bact, !(Sample_type == "male_flowers" | Sample_type == "female_flowers"))
+physeq16S.bact = prune_taxa(taxa_sums(physeq16S.bact) > 0, physeq16S.bact)
+physeqITS.fungi = subset_samples(physeqITS.fungi, !(Sample_type == "male_flowers" | Sample_type == "female_flowers" | Sample_type == "root_tissue"))
+physeqITS.fungi = prune_taxa(taxa_sums(physeqITS.fungi) > 0, physeqITS.fungi)
+
+## Also remove the water controls
+physeq16S.bact = subset_samples(physeq16S.bact, !(Sample_type == "water_control"))
+physeq16S.bact = prune_taxa(taxa_sums(physeq16S.bact) > 0, physeq16S.bact)
+physeqITS.fungi = subset_samples(physeqITS.fungi, !(Sample_type == "water_control"))
+physeqITS.fungi = prune_taxa(taxa_sums(physeqITS.fungi) > 0, physeqITS.fungi)
+```
+
+The read depth of our samples varies quite a bit. To normalize this lets use rarefaction.
+```{r, message=FALSE, warning=FALSE}
+## Rarify samples. This samples the OTUs for all samples to an even depth to account for large differences in sample sizes. Sampling is based 
+set.seed(72)
+physeq16S.bact.rare = rarefy_even_depth(physeq16S.bact)
+physeq16S.bact.rare = prune_taxa(taxa_sums(physeq16S.bact.rare) > 0, physeq16S.bact.rare)
+set.seed(72)
+physeqITS.fungi.rare = rarefy_even_depth(physeqITS.fungi)
+physeqITS.fungi.rare = prune_taxa(taxa_sums(physeqITS.fungi.rare) > 0, physeqITS.fungi.rare)
+
+## Normalize the OTU count data to the total for that sample. This gives you relative abundance for each OTU.
+physeq16S.bact.rare = transform_sample_counts(physeq16S.bact.rare, function(x) x/sum(x))
+physeqITS.fungi.rare = transform_sample_counts(physeqITS.fungi.rare, function(x) x/sum(x))
+
+```
+
+### Seting colors, shapes, and figure functions
+
+I want to have a consistent color and shape scheme through all figures so I will set that here. Colors come from https://personal.sron.nl/~pault/data/colourschemes.pdf and should be colorblind friendly.
+
+```{r, message=FALSE, warning=FALSE}
+# Set colors
+## Overlapping
+type.col = c("Bulk soil" = "#1965B0", "Flowers" = "#7BAFDE", "Leaves" = "#4EB265", "Rhizosphere soil" = "#F7F056", "Root tissue" = "#DC050C")
+field.col = c("Crittenden North" = "#1965B0", "McGowan Late" = "#7BAFDE", "East Ithaca" = "#4EB265", "McGowan" = "#CAE0AB", "Research North" = "#F7F056", "Freeville" = "#DC050C")
+
+## Non-overlapping. We will not use these
+#type.col = c("Bulk soil" = "#882E72", "Flowers" = "#1965B0", "Leaves" = "#5289C7", "Rhizosphere soil" = "#7BAFDE", "Root tissue" = "#4EB265")
+#field.col = c("Crittenden North" = "#CAE0AB", "McGowan Late" = "#F7F056", "East Ithaca" = "#F4A736", "McGowan" = "#E8601C", "Research North" = "#DC050C", "Freeville" = "#72190E")
+
+## What does this look like
+pie(rep(1,5), labels=names(type.col), col=type.col)
+
+pie(rep(1,6), labels=names(field.col), col=field.col)
+
+# Set Shapes
+field.shape = c("Crittenden North" = 21, "McGowan Late" = 22, "East Ithaca" = 23, "McGowan" = 24, "Research North" = 25, "Freeville" = 8)
+
+# This is just a function for getting the legends for graphs. This will be used when making plots for publication.
+g_legend<-function(a.gplot){
+  tmp <- ggplot_gtable(ggplot_build(a.gplot))
+  leg <- which(sapply(tmp$grobs, function(x) x$name) == "guide-box")
+  legend <- tmp$grobs[[leg]]
+  return(legend)}
+
+# These are functions for reordering the x axis within faceted figures
+reorder_within <- function(x, by, within, fun = mean, sep = "___", ...) {
+  new_x <- paste(x, within, sep = sep)
+  stats::reorder(new_x, by, FUN = fun)
+}
+scale_x_reordered <- function(..., sep = "___") {
+  reg <- paste0(sep, ".+$")
+  ggplot2::scale_x_discrete(labels = function(x) gsub(reg, "", x), ...)
+}
+```
+
+
+## Part 1: Community composition and ordination analysis
+
+In this analysis I will compare the overall bacterial and fungal community compositions between sample types (i.e. plant parts) and fields.
+
+### Inital stats
+First lets see how many OTUs there are and how many phyla are found
+
+```{r, message=FALSE, warning=FALSE}
+print(paste("There are", ntaxa(physeq16S.bact.rare), "bacterial OTUS"))
+print(paste("There are", ntaxa(physeqITS.fungi.rare), "fungal OTUS"))
+
+print(paste("There are", length(na.omit(c(unique(tax_table(physeq16S.bact.rare)[,2])))), "bacterial Phyla"))
+print(paste("There are", length(na.omit(c(unique(tax_table(physeqITS.fungi.rare)[,2])))), "fungal Phyla"))
+
+```
+
+### Alpha diversity
+
+Does OTU evenness vary across plant compartments?
+
+```{r, fig.height=6, fig.width=3, message=FALSE, warning=FALSE}
+new_sample_types = data.frame(Sample_type = c("bulk_soil", "rhizosphere_soil", "root_tissue", "leaves", "flowers"),
+                              Sample_type_new = c("Bulk soil", "Rhizosphere soil", "Root tissue", "Leaves", "Flowers"))
+
+bact.alphadiv = full_join(tibble::rownames_to_column(data.frame(Shannon = diversity(t(otu_table(physeq16S.bact.rare)), index = "shannon")), var="sample_ID"),
+                         tibble::rownames_to_column(data.frame(Richness = specnumber(t(otu_table(physeq16S.bact.rare)))), var="sample_ID"), by = "sample_ID") %>%
+  mutate(Evenness = Shannon/log(Richness)) %>%
+  left_join(data.frame(sample_data(physeq16S.bact.rare)), by = "sample_ID") %>%
+  left_join(new_sample_types, by="Sample_type") %>%
+  mutate(Sample_type_new = factor(Sample_type_new, 
+                                  levels=c("Bulk soil", "Rhizosphere soil", "Root tissue", "Leaves", "Flowers")),
+         Sample_type = factor(Sample_type, 
+                              levels = c("bulk_soil", "rhizosphere_soil", "root_tissue", "leaves", "flowers")),
+         Field = factor(Field), organism = "Bacteria") %>%
+  dplyr::select(organism, sample_ID, Shannon, Richness, Evenness, Field, Sample_type, Sample_type_new) %>%
+  tidyr::gather(key = "Index", value = "diversity", -organism, -sample_ID, -Field, -Sample_type, -Sample_type_new)
+
+fungi.alphadiv = full_join(tibble::rownames_to_column(data.frame(Shannon = diversity(t(otu_table(physeqITS.fungi.rare)), index = "shannon")), var="sample_ID"),
+                         tibble::rownames_to_column(data.frame(Richness = specnumber(t(otu_table(physeqITS.fungi.rare)))), var="sample_ID"), by = "sample_ID") %>%
+  mutate(Evenness = Shannon/log(Richness)) %>%
+  left_join(data.frame(sample_data(physeqITS.fungi.rare)), by = "sample_ID") %>%
+  left_join(new_sample_types, by="Sample_type") %>%
+  mutate(Sample_type_new = factor(Sample_type_new, 
+                                  levels=c("Bulk soil", "Rhizosphere soil", "Root tissue", "Leaves", "Flowers")),
+         Sample_type = factor(Sample_type, 
+                              levels = c("bulk_soil", "rhizosphere_soil", "root_tissue", "leaves", "flowers")),
+         Field = factor(Field), organism = "Fungi") %>%
+  dplyr::select(organism, sample_ID, Shannon, Richness, Evenness, Field, Sample_type, Sample_type_new) %>%
+  tidyr::gather(key = "Index", value = "diversity", -organism, -sample_ID, -Field, -Sample_type, -Sample_type_new)
+  
+alphadiv = rbind(bact.alphadiv, fungi.alphadiv)
+
+div.aov.list = list()
+div.cld.df = data.frame()
+
+for (org in c("Bacteria", "Fungi")){
+  div_index = "Evenness"
+  div.model = lm(diversity ~ Sample_type, data=filter(alphadiv, Index == div_index, organism == org))
+  div.aov = anova(div.model)
+  div.aov.list[[paste(org, div_index, sep="_")]] = div.aov
+  div.posthoc = glht(div.model, linfct = mcp(Sample_type = "Tukey"))
+  div.cld = data.frame(Index = div_index, sig_group = cld(div.posthoc)$mcletters$Letters) %>%
+    tibble::rownames_to_column(var="Sample_type") %>%
+    left_join(new_sample_types, by="Sample_type") %>%
+    mutate(Sample_type_new = factor(Sample_type_new, 
+                                    levels=c("Bulk soil", "Rhizosphere soil", "Root tissue", "Leaves", "Flowers")),
+           organism = org)
+  div.cld.df = rbind(div.cld.df, div.cld)
+}
+
+div.aov.list
+
+alphadiv = rbind(alphadiv, 
+                 data.frame(organism = "Fungi", sample_ID = NA, Field = NA, Sample_type = NA,
+                            Sample_type_new = "Root tissue", Index = "Evenness", diversity=NA))
+
+bact_alpha.plot = ggplot(data=filter(alphadiv, Index == "Evenness", organism == "Bacteria"), aes(x=Sample_type_new, y=diversity)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(alpha=0.3) +
+  geom_text(data=filter(div.cld.df, Index == "Evenness", organism == "Bacteria"), aes(x=Sample_type_new, label=sig_group), y=1, size=4) +
+  lims(y=c(0, 1)) +
+  labs(x="Compartment", y="Pielou's Evenness") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=45, hjust=1),
+        text = element_text(size=16))
+
+fungi_alpha.plot = ggplot(data=filter(alphadiv, Index == "Evenness", organism == "Fungi"), aes(x=Sample_type_new, y=diversity)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(alpha=0.3) +
+  geom_text(data=filter(div.cld.df, Index == "Evenness", organism == "Fungi"), aes(x=Sample_type_new, label=sig_group), y=1, size=4) +
+  lims(y=c(0, 1)) +
+  labs(x="Compartment", y="Pielou's Evenness") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=45, hjust=1),
+        text = element_text(size=16))
+
+
+# Use cowplot::plot_grid to plot both together. Remove the legend from the plots and add in the full legend
+alpha.plot = cowplot::plot_grid(bact_alpha.plot + theme(axis.title = element_blank(), axis.text.x = element_blank(),
+                                                        plot.margin = margin(7, 0, 0, 5, "mm")), 
+                                fungi_alpha.plot + theme(axis.title = element_blank(),
+                                                         plot.margin = margin(7, 0, 0, 5, "mm")), 
+                                align = "v", rel_heights = c(0.7, 1), ncol=1, labels = c(" a", " b"))
+
+y.grob <- grid::textGrob("                     Pielou's Evenness", gp=grid::gpar(fontsize=14), rot=90)
+x.grob <- grid::textGrob("          Compartment", gp=grid::gpar(fontsize=14))
+
+alpha.plot = gridExtra::arrangeGrob(alpha.plot, left = y.grob, bottom = x.grob)
+
+gridExtra::grid.arrange(alpha.plot)
+
+## Saving figure for publication
+options(bitmapType='cairo')
+#ggsave(plot = alpha.plot, filename = "/home/sam/notebooks/hemp_microbiome/figures/evenness_plot.tiff",
+#       device = "tiff", width=3, height=6, units="in")
+```
+
+
+### Taxanomic makeup
+
+Now lets visuallize the taxonomic makeup of the communities at the phylum or class level. Simply, I will calculate the proportion of reads from across all plants/samples that are assigned to each phylum or class. I'll do this separately for each sample type so that we can compare the rough composition between types.
+
+#### Bacteria
+
+```{r, message=FALSE, warning=FALSE, fig.height=7, fig.width=4}
+
+bact.phyla.sum = data.frame()
+
+for (samtype in c("bulk_soil", "rhizosphere_soil", "root_tissue", "leaves", "flowers")){
+  sub.physeq = subset_samples(physeq16S.bact.rare, Sample_type == as.character(samtype))
+  sub.physeq = prune_taxa(taxa_sums(sub.physeq) > 0, sub.physeq)
+  sub.otu.table = otu_table(sub.physeq)
+  sub.tax.table = data.frame(tax_table(sub.physeq), stringsAsFactors = FALSE) %>%
+    rownames_to_column(var="OTU")
+  sub.otu.df = data.frame(sub.otu.table) %>%
+    rownames_to_column(var="OTU") %>%
+    gather(key="sample", value="count", -OTU) %>% 
+    filter(count > 0) %>%
+    inner_join(sub.tax.table, by="OTU")
+  
+  sub.phyla.sum = sub.otu.df %>%
+    mutate(taxa = gsub("D_.__", "", ifelse(Rank2 == "D_1__Proteobacteria", as.character(Rank3), as.character(Rank2)))) %>%
+    group_by(taxa, sample) %>%
+    summarize(RA = sum(count)*100) %>%
+    as.data.frame() %>%
+    tidyr::spread(key=sample, value=RA) %>%
+    tidyr::gather(key=sample, value=RA, -taxa) %>%
+    mutate(RA = ifelse(is.na(RA), 0, RA)) %>%
+    mutate(Sample_type = samtype)
+  
+  bact.phyla.sum = rbind(bact.phyla.sum, sub.phyla.sum)
+}
+
+bact.phyla.sum.mean = bact.phyla.sum %>%
+  group_by(taxa, Sample_type) %>%
+  summarize(mean_RA = mean(RA)) %>%
+  as.data.frame
+  
+bact.high.taxa = unique(bact.phyla.sum.mean[bact.phyla.sum.mean$mean_RA >= 1,]$taxa)
+bact.taxa.colors = c("#D1BBD7", "#AE76A3", "#882E72", "#1965B0", "#5289C7", "#7BAFDE", "#4EB265", "#90C987", "#CAE0AB", "#F7F056", "#F4A736", "#E8601C", "#DC050C", "grey")
+names(bact.taxa.colors) = c(bact.high.taxa, "less than 1% each")
+
+new_sample_types = data.frame(Sample_type = c("bulk_soil", "rhizosphere_soil", "root_tissue", "leaves", "flowers"),
+                              Sample_type_new = c("Bulk soil", "Rhizosphere soil", "Root tissue", "Leaves", "Flowers"))
+
+bact.phyla.sum.high = bact.phyla.sum %>%
+  mutate(taxa = ifelse(taxa %in% bact.high.taxa, taxa, "less than 1% each")) %>%
+  group_by(taxa, sample, Sample_type) %>%
+  summarize(RA = sum(RA)) %>%
+  as.data.frame %>%
+  group_by(taxa, Sample_type) %>%
+  summarize(mean_RA = mean(RA),
+            sd_RA = sd(RA, na.rm = TRUE),
+            n_samples = n()) %>%
+  as.data.frame %>%
+  mutate(SE_RA = sd_RA/sqrt(n_samples)) %>%
+  inner_join(new_sample_types)
+bact.phyla.sum.high$taxa = factor(bact.phyla.sum.high$taxa, levels=c(sort(bact.high.taxa), "less than 1% each"))
+bact.phyla.sum.high$Sample_type_new = factor(bact.phyla.sum.high$Sample_type_new, levels=c("Flowers", "Leaves", "Root tissue", "Rhizosphere soil", "Bulk soil"))
+
+
+bact.comm.plot = ggplot(data=bact.phyla.sum.high, aes(x=taxa, y=mean_RA, fill=taxa)) +
+  geom_bar(stat="identity") +
+  geom_errorbar(aes(ymin=mean_RA-SE_RA, ymax=mean_RA+SE_RA), width = 0.5, size=0.25) +
+  scale_fill_manual(values=bact.taxa.colors) +
+  labs(x="Phylum/Class", y="Relative abundance (% of reads)") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=45, hjust=1),
+        legend.position = "none") +
+  facet_wrap(~Sample_type_new, nrow = 5)
+bact.comm.plot
+
+
+```
+
+Here is the same data but in table format.
+
+```{r, message=FALSE, warning=FALSE}
+bact.phyla.sum.high.df = bact.phyla.sum.high %>%
+  dplyr::select(taxa, Sample_type, mean_RA) %>%
+  spread(key=Sample_type, value=mean_RA)
+
+kable(bact.phyla.sum.high.df, "html") %>%
+  kable_styling() %>%
+  scroll_box(width = "100%", height="400px")
+
+```
+
+Using nonparametric Kruskal test with Dunn posthoc test, lets see if the relative abundances of these phyla differ across plant compartments.
+
+```{r, message=FALSE, warning=FALSE}
+high.taxa = unique(bact.phyla.sum.mean[bact.phyla.sum.mean$mean_RA >= 1,]$taxa)
+bact.posthoc.res = data.frame()
+for (subtaxa in high.taxa){
+  taxa.model = kruskal.test(RA~Sample_type, data=filter(bact.phyla.sum, taxa == subtaxa))
+  if (p.adjust(taxa.model$p.value, n=length(high.taxa), method="bonferroni") < 0.05){
+    posthoc.res = FSA::dunnTest(RA~Sample_type, data=filter(bact.phyla.sum, taxa == subtaxa))
+    posthoc.res = posthoc.res$res
+    posthoc.cld = rcompanion::cldList(comparison = posthoc.res$Comparison,
+                                      p.value    = posthoc.res$P.adj,
+                                      threshold  = 0.05)
+  } else{
+    posthoc.cld = data.frame(Group = NA, Letter = NA)
+  }
+  sub.bact.posthoc.res = data.frame(taxa = subtaxa, X2 = taxa.model$statistic,
+                                    Pvalue = taxa.model$p.value,
+                                    padj = p.adjust(taxa.model$p.value, n=length(high.taxa), method="bonferroni"),
+                                    Sample_type = posthoc.cld$Group,
+                                    group = posthoc.cld$Letter,
+                                    stringsAsFactors = FALSE)
+  bact.posthoc.res = rbind(bact.posthoc.res, sub.bact.posthoc.res)
+}
+bact.posthoc.res$Sample_type = factor(bact.posthoc.res$Sample_type, levels = c("bulk_soil", "rhizosphere_soil", "root_tissue", "leaves", "flowers"))
+#write.table(bact.posthoc.res, "/home/sam/notebooks/hemp_microbiome/data/bact_phyla_across_compartments.txt", quote=FALSE, row.names = FALSE)
+
+kable(bact.posthoc.res %>%
+        arrange(taxa, Sample_type), "html") %>%
+  kable_styling() %>%
+  scroll_box(width = "100%", height="400px")
+```
+
+Plot the results.
+
+```{r, message=FALSE, warning=FALSE, fig.height=7, fig.width=7}
+bact.phyla.high = bact.phyla.sum %>%
+  mutate(taxa = ifelse(taxa %in% bact.high.taxa, taxa, "less than 1% each")) %>%
+  group_by(taxa, sample, Sample_type) %>%
+  summarize(RA = sum(RA)) %>%
+  as.data.frame %>%
+  inner_join(new_sample_types)
+
+bact.phyla.high$taxa = factor(bact.phyla.high$taxa, levels=c(sort(bact.high.taxa), "less than 1% each"))
+bact.phyla.high$Sample_type_new = factor(bact.phyla.high$Sample_type_new, levels=c("Flowers", "Leaves", "Root tissue", "Rhizosphere soil", "Bulk soil"))
+
+bact.posthoc.res.y = bact.phyla.high %>%
+  group_by(taxa) %>%
+  summarize(max_RA = max(RA)) %>%
+  as.data.frame %>%
+  mutate(y = max_RA*1.2) %>%
+  inner_join(bact.posthoc.res, by = c("taxa")) %>%
+  inner_join(new_sample_types)
+
+bact.posthoc.res.y$taxa = factor(bact.posthoc.res.y$taxa, levels=c(sort(bact.high.taxa), "less than 1% each"))
+bact.posthoc.res.y$Sample_type_new = factor(bact.posthoc.res.y$Sample_type_new, levels=c("Bulk soil", "Rhizosphere soil", "Root tissue", "Leaves", "Flowers"))
+bact.phyla.high$Sample_type_new = factor(bact.phyla.high$Sample_type_new, levels=c("Bulk soil", "Rhizosphere soil", "Root tissue", "Leaves", "Flowers"))
+
+bact.comm.plot = ggplot(data=bact.phyla.high, aes(x=Sample_type_new, y=RA, fill=Sample_type_new)) +
+  geom_boxplot() +
+  geom_text(data=bact.posthoc.res.y, aes(x=Sample_type_new, y=y, label=group)) +
+  scale_fill_manual(values=type.col) +
+  labs(x="Compartment", y="Relative abundance (% of reads)") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=45, hjust=1),
+        legend.position = "none") +
+  facet_wrap(~taxa, scales = "free_y")
+bact.comm.plot
+
+#ggsave(plot = bact.comm.plot, filename = "/home/sam/notebooks/hemp_microbiome/figures/bacteria_taxa_abd.tiff",
+#       device = "tiff", width=7, height=7, units="in")
+```
+
+#### Fungi
+
+```{r, message=FALSE, warning=FALSE, fig.height=7, fig.width=4}
+
+fungi.phyla.sum = data.frame()
+
+for (samtype in c("bulk_soil", "rhizosphere_soil", "leaves", "flowers")){
+  sub.physeq = subset_samples(physeqITS.fungi.rare, Sample_type == samtype)
+  sub.physeq = prune_taxa(taxa_sums(sub.physeq) > 0, sub.physeq)
+  sub.otu.table = otu_table(sub.physeq)
+  sub.tax.table = data.frame(tax_table(sub.physeq), stringsAsFactors = FALSE) %>%
+    rownames_to_column(var="OTU")
+  sub.otu.df = data.frame(sub.otu.table) %>%
+    rownames_to_column(var="OTU") %>%
+    gather(key="sample", value="count", -OTU) %>% 
+    filter(count > 0) %>%
+    inner_join(sub.tax.table, by="OTU")
+  
+  sub.phyla.sum = sub.otu.df %>%
+    mutate(taxa = ifelse(is.na(Class), ifelse(is.na(Phylum), "Unclassified Fungi", paste("Unclassified", as.character(Phylum))), as.character(Class))) %>%
+    group_by(taxa, sample) %>%
+    summarize(RA = sum(count)*100) %>%
+    as.data.frame %>%
+    tidyr::spread(key=sample, value=RA) %>%
+    tidyr::gather(key=sample, value=RA, -taxa) %>%
+    mutate(RA = ifelse(is.na(RA), 0, RA)) %>%
+    mutate(Sample_type = samtype)
+  
+  fungi.phyla.sum = rbind(fungi.phyla.sum, sub.phyla.sum)
+}
+
+fungi.phyla.sum.mean = fungi.phyla.sum %>%
+  group_by(taxa, Sample_type) %>%
+  summarize(mean_RA = mean(RA)) %>%
+  as.data.frame
+  
+fungi.high.taxa = unique(fungi.phyla.sum.mean[fungi.phyla.sum.mean$mean_RA >= 1 & !(fungi.phyla.sum.mean$taxa %in% c("Unclassified Ascomycota", "Unclassified Fungi")),]$taxa)
+fungi.taxa.colors = c("#882E72", "#1965B0", "#5289C7", "#7BAFDE", "#4EB265", "#CAE0AB", "#F7F056", "#F4A736","#E8601C", "#DC050C", "#72190E","grey")
+names(fungi.taxa.colors) = c(fungi.high.taxa, "Unclassified Ascomycota", "Unclassified Fungi", "less than 1% each")
+
+new_sample_types = data.frame(Sample_type = c("bulk_soil", "rhizosphere_soil", "root_tissue", "leaves", "flowers"),
+                              Sample_type_new = c("Bulk soil", "Rhizosphere soil", "Root tissue", "Leaves", "Flowers"))
+
+fungi.phyla.sum.high = fungi.phyla.sum %>%
+  mutate(taxa = ifelse(taxa %in% names(fungi.taxa.colors), taxa, "less than 1% each")) %>%
+  group_by(taxa, sample, Sample_type) %>%
+  summarize(RA = sum(RA)) %>%
+  as.data.frame %>%
+  group_by(taxa, Sample_type) %>%
+  summarize(mean_RA = mean(RA),
+            sd_RA = sd(RA),
+            n_samples=n()) %>%
+  as.data.frame %>%
+  mutate(SE_RA = sd_RA/sqrt(n_samples)) %>%
+  inner_join(new_sample_types)
+fungi.phyla.sum.high$taxa = factor(fungi.phyla.sum.high$taxa, levels=c(sort(fungi.high.taxa), "Unclassified Ascomycota", "Unclassified Fungi", "less than 1% each"))
+fungi.phyla.sum.high$Sample_type_new = factor(fungi.phyla.sum.high$Sample_type_new, levels=c("Flowers", "Leaves", "Rhizosphere soil", "Bulk soil"))
+
+
+fungi.comm.plot = ggplot(data=fungi.phyla.sum.high, aes(x=taxa, y=mean_RA, fill=taxa)) +
+  geom_bar(stat="identity") +
+  geom_errorbar(aes(ymin=mean_RA-SE_RA, ymax=mean_RA+SE_RA), width = 0.5, size=0.25) +
+  scale_fill_manual(values=fungi.taxa.colors) +
+  labs(x="Class", y="Relative abundance (% of reads)") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=45, hjust=1),
+        legend.position = "none") +
+  facet_wrap(~Sample_type_new, nrow = 5)
+fungi.comm.plot
+
+```
+
+Here is the same data but in table format.
+
+```{r, message=FALSE, warning=FALSE}
+fungi.phyla.sum.high.df = fungi.phyla.sum.high %>%
+  dplyr::select(taxa, Sample_type, mean_RA) %>%
+  spread(key=Sample_type, value=mean_RA)
+
+kable(fungi.phyla.sum.high.df, "html") %>%
+  kable_styling() %>%
+  scroll_box(width = "100%", height="400px")
+```
+
+Using nonparametric Kruskal test with Dunn posthoc test, lets see if the relative abundances of these taxa differ across plant compartments.
+
+
+```{r, message=FALSE, warning=FALSE}
+fungi.posthoc.res = data.frame()
+for (subtaxa in fungi.high.taxa){
+  taxa.model = kruskal.test(RA~Sample_type, data=filter(fungi.phyla.sum, taxa == subtaxa))
+  if (p.adjust(taxa.model$p.value, n=length(high.taxa), method="bonferroni") < 0.05){
+    posthoc.res = FSA::dunnTest(RA~Sample_type, data=filter(fungi.phyla.sum, taxa == subtaxa))
+    posthoc.res = posthoc.res$res
+    posthoc.cld = rcompanion::cldList(comparison = posthoc.res$Comparison,
+                                      p.value    = posthoc.res$P.adj,
+                                      threshold  = 0.05)
+  } else{
+    posthoc.cld = data.frame(Group = NA, Letter = NA)
+  }
+  sub.fungi.posthoc.res = data.frame(taxa = subtaxa, X2 = taxa.model$statistic,
+                                    Pvalue = taxa.model$p.value,
+                                    padj = p.adjust(taxa.model$p.value, n=length(high.taxa), method="bonferroni"),
+                                    Sample_type = posthoc.cld$Group,
+                                    group = posthoc.cld$Letter,
+                                    stringsAsFactors = FALSE)
+  fungi.posthoc.res = rbind(fungi.posthoc.res, sub.fungi.posthoc.res)
+}
+fungi.posthoc.res$Sample_type = factor(fungi.posthoc.res$Sample_type, levels = c("bulk_soil", "rhizosphere_soil", "root_tissue", "leaves", "flowers"))
+#write.table(fungi.posthoc.res, "/home/sam/notebooks/hemp_microbiome/data/fungi_phyla_across_compartments.txt", quote=FALSE, row.names = FALSE)
+
+kable(fungi.posthoc.res %>%
+        arrange(taxa, Sample_type), "html") %>%
+  kable_styling() %>%
+  scroll_box(width = "100%", height="400px")
+```
+
+Now plot the results.
+
+```{r, message=FALSE, warning=FALSE, fig.height=7, fig.width=7}
+fungi.phyla.high = fungi.phyla.sum %>%
+  mutate(taxa = ifelse(taxa %in% fungi.high.taxa, taxa, "less than 1% each")) %>%
+  group_by(taxa, sample, Sample_type) %>%
+  summarize(RA = sum(RA)) %>%
+  as.data.frame %>%
+  inner_join(new_sample_types)
+
+fungi.phyla.high$taxa = factor(fungi.phyla.high$taxa, levels=c(sort(fungi.high.taxa), "less than 1% each"))
+fungi.phyla.high$Sample_type_new = factor(fungi.phyla.high$Sample_type_new, levels=c("Flowers", "Leaves", "Root tissue", "Rhizosphere soil", "Bulk soil"))
+
+fungi.posthoc.res.y = fungi.phyla.high %>%
+  group_by(taxa) %>%
+  summarize(max_RA = max(RA)) %>%
+  as.data.frame %>%
+  mutate(y = max_RA*1.2) %>%
+  inner_join(fungi.posthoc.res, by = c("taxa")) %>%
+  inner_join(new_sample_types)
+
+fungi.posthoc.res.y$taxa = factor(fungi.posthoc.res.y$taxa, levels=c(sort(fungi.high.taxa), "less than 1% each"))
+fungi.posthoc.res.y$Sample_type_new = factor(fungi.posthoc.res.y$Sample_type_new, levels=c("Bulk soil", "Rhizosphere soil", "Root tissue", "Leaves", "Flowers"))
+fungi.phyla.high$Sample_type_new = factor(fungi.phyla.high$Sample_type_new, levels=c("Bulk soil", "Rhizosphere soil", "Root tissue", "Leaves", "Flowers"))
+
+fungi.comm.plot = ggplot(data=fungi.phyla.high, aes(x=Sample_type_new, y=RA, fill=Sample_type_new)) +
+  geom_boxplot() +
+  geom_text(data=fungi.posthoc.res.y, aes(x=Sample_type_new, y=y, label=group)) +
+  scale_fill_manual(values=type.col) +
+  labs(x="Compartment", y="Relative abundance (% of reads)") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle=45, hjust=1),
+        legend.position = "none") +
+  facet_wrap(~taxa, scales = "free_y")
+fungi.comm.plot
+
+#ggsave(plot = fungi.comm.plot, filename = "/home/sam/notebooks/hemp_microbiome/figures/fungi_taxa_abd.tiff",
+#       device = "tiff", width=7, height=7, units="in")
+```
+
+
+### Ordination and PERMANOVA
+
+With this analysis I will be statistically comparing the community compositions of the samples. I am testing if the variation in community compositions can be statistically explained by either sample type, field or an interaction between the two. For reference, I am using Bray Curtis dissimilarity for this analysis. I am using this metric mostly to stay consistent because I cannot use UniFrac for the fungi as I do not have a phylogenetic tree for that data.
+
+#### Bacteria
+
+```{r, message=FALSE, warning=FALSE, results=FALSE}
+# Use the function ordinate from phyloseq to get the xy coordinates of an NMDS of the distance matrix.
+set.seed(4242)
+bact.bray.ord = ordinate(physeq16S.bact.rare, "NMDS", distance="bray", trymax=1000)
+bact.bray.ord.df = data.frame(bact.bray.ord$points)
+bact.bray.ord.df$sample_ID = rownames(bact.bray.ord.df)
+
+# Add the metadata from the phyloseq to the xy coordinates so that you can do some coloring and other asthetics. Lets also change some of the variable entries to make them look better on a figure (remove "_" and capitalize first letters)
+bact.metadata = data.frame(sample_data(physeq16S.bact.rare), stringsAsFactors = FALSE) %>%
+  mutate(Field = ifelse(Field == "Blight", "Crittenden North", gsub("_", " ", Field))) %>%
+  mutate(Sample_type = factor(gsub("_", " ", paste(toupper(substr(Sample_type, 1, 1)), substr(Sample_type, 2, nchar(Sample_type)), sep="")), 
+                              levels=c("Bulk soil", "Rhizosphere soil", "Root tissue", "Leaves", "Flowers")))
+
+bact.bray.ord.df = full_join(bact.bray.ord.df, bact.metadata, by="sample_ID")
+```
+
+```{r, message=FALSE, warning=FALSE}
+# Make a distance matrix using the phyloseq distance function. This is based on the function vegdist from package vegan
+bact.bray.dist = phyloseq::distance(physeq16S.bact.rare, "bray")
+
+# Run adonis function with distance ~ Sample_type*field as the formula.
+set.seed(4242)
+bact.bray.adon = adonis(bact.bray.dist ~ Sample_type*Field, as(sample_data(physeq16S.bact.rare), "data.frame"))
+print(bact.bray.adon)
+```
+
+Now I'll plot the ordination of this data to visualize this difference.
+
+```{r, fig.height=6, fig.width=7, message=FALSE, warning=FALSE}
+# Plot the ordination
+bacteria.ord.plot = ggplot(data=bact.bray.ord.df, aes(x=MDS1, y=MDS2)) +
+  geom_point(aes(color=Sample_type, fill=Sample_type, shape=Field), size=3) +
+  scale_color_manual(values=type.col) +
+  scale_fill_manual(values=type.col) +
+  scale_shape_manual(values=field.shape) +
+  labs(x="NMDS 1", y="NMDS 2", fill="Compartment", color="Compartment", shape="Field", 
+       title=paste("Bacteria (Stress=", round(bact.bray.ord$stress, digits = 4), ")", sep="")) +
+  theme_bw() +
+  theme(text = element_text(size=16),
+        plot.title = element_text(hjust = 0.5))
+
+bacteria.ord.plot
+```
+
+Now I'll run the PERMANOVA for each plant compartment individually. In this case, field location is the only explanatory variable.
+
+```{r, message=FALSE, warning=FALSE}
+for (plant_part in c("bulk_soil", "rhizosphere_soil", "root_tissue", "leaves", "flowers")){
+  sub.physeq = subset_samples(physeq16S.bact.rare, Sample_type == plant_part)
+  sub.physeq = prune_taxa(taxa_sums(sub.physeq) > 0, sub.physeq)
+  
+  # Make a distance matrix using the phyloseq distance function. This is based on the function vegdist from package vegan
+  sub.physeq.dist = phyloseq::distance(sub.physeq, "bray")
+  
+  # Run adonis function with distance ~ Sample_type*field as the formula.
+  set.seed(4242)
+  sub.physeq.adon = adonis(sub.physeq.dist ~ Field, as(sample_data(sub.physeq), "data.frame"))
+  writeLines(paste("Running", plant_part, "samples now"))
+  print(sub.physeq.adon)
+  writeLines(paste("\n\nAdjusted pvalue for Field =", p.adjust(sub.physeq.adon$aov.tab$`Pr(>F)`[1], method="bonferroni", n=5)))
+  writeLines("\n\n-----\n\n")
+}
+```
+
+
+#### Fungi
+
+```{r, message=FALSE, warning=FALSE, results=FALSE}
+# Use the function ordinate from phyloseq to get the xy coordinates of an NMDS of the distance matrix.
+set.seed(4242)
+fungi.bray.ord = ordinate(physeqITS.fungi.rare, "NMDS", distance="bray", trymax=1000)
+fungi.bray.ord.df = data.frame(fungi.bray.ord$points)
+fungi.bray.ord.df$sample_ID = rownames(fungi.bray.ord.df)
+
+# Add the metadata from the phyloseq to the xy coordinates so that you can do some coloring and other asthetics. Lets also change some of the variable entries to make them look better on a figure (remove "_" and capitalize first letters)
+fungi.metadata = data.frame(sample_data(physeqITS.fungi.rare), stringsAsFactors = FALSE) %>%
+  mutate(Field = ifelse(Field == "Blight", "Crittenden North", gsub("_", " ", Field))) %>%
+  mutate(Sample_type = gsub("_", " ", paste(toupper(substr(Sample_type, 1, 1)), substr(Sample_type, 2, nchar(Sample_type)), sep="")))
+fungi.bray.ord.df = full_join(fungi.bray.ord.df, fungi.metadata, by="sample_ID")
+```
+
+```{r, message=FALSE, warning=FALSE}
+# Make a distance matrix using the phyloseq distance function. This is based on the function vegdist from package vegan
+fungi.bray.dist = phyloseq::distance(physeqITS.fungi.rare, "bray")
+
+# Run adonis function with distance ~ Sample_type*field as the formula.
+set.seed(4242)
+fungi.bray.adon = adonis(fungi.bray.dist ~ Sample_type*Field, as(sample_data(physeqITS.fungi.rare), "data.frame"))
+print(fungi.bray.adon)
+```
+
+Now I'll plot the ordination of this data to visualize this difference.
+
+```{r, fig.height=6, fig.width=7, message=FALSE, warning=FALSE}
+# Plot the ordination
+fungal.ord.plot = ggplot(data=fungi.bray.ord.df, aes(x=MDS1, y=MDS2)) +
+  geom_point(aes(color=Sample_type, fill=Sample_type, shape=Field), size=3) +
+  scale_color_manual(values=type.col) +
+  scale_fill_manual(values=type.col) +
+  scale_shape_manual(values=field.shape) +
+  labs(x="NMDS 1", y="NMDS 2", fill="Compartment", color="Compartment", shape="Field", 
+       title=paste("Fungi (Stress=", round(fungi.bray.ord$stress, digits = 4), ")", sep="")) +
+  theme_bw() +
+  theme(text = element_text(size=16),
+        plot.title = element_text(hjust = 0.5))
+fungal.ord.plot
+```
+
+Now I'll run the PERMANOVA for each plant compartment individually. In this case, field location is the only explanatory variable.
+
+```{r, message=FALSE, warning=FALSE}
+for (plant_part in c("bulk_soil", "rhizosphere_soil", "leaves", "flowers")){
+  sub.physeq = subset_samples(physeqITS.fungi.rare, Sample_type == plant_part)
+  sub.physeq = prune_taxa(taxa_sums(sub.physeq) > 0, sub.physeq)
+  
+  # Make a distance matrix using the phyloseq distance function. This is based on the function vegdist from package vegan
+  sub.physeq.dist = phyloseq::distance(sub.physeq, "bray")
+  
+  # Run adonis function with distance ~ Sample_type*field as the formula.
+  set.seed(4242)
+  sub.physeq.adon = adonis(sub.physeq.dist ~ Field, as(sample_data(sub.physeq), "data.frame"))
+  writeLines(paste("Running", plant_part, "samples now"))
+  print(sub.physeq.adon)
+  writeLines(paste("\n\nAdjusted pvalue for Field =", p.adjust(sub.physeq.adon$aov.tab$`Pr(>F)`[1], method="bonferroni", n=4)))
+  writeLines("\n\n-----\n\n")
+}
+```
+
+### Ordination plots together
+
+For the publication, we probably want these ordination to be in the same figure.
+
+```{r, fig.height=4, fig.width=7, message=FALSE, warning=FALSE}
+
+plottheme = theme(title = element_blank(),
+                  axis.text = element_text(size=10),
+                  axis.title = element_blank(),
+                  legend.text = element_text(size=10),
+                  legend.title = element_text(size=12))
+
+# Get legend from bacterial plot
+ord.legend = g_legend(bacteria.ord.plot + plottheme)
+
+# Use cowplot::plot_grid to plot both together. Remove the legend from the plots and add in the full legend
+ord.plot = cowplot::plot_grid(bacteria.ord.plot + plottheme + theme(legend.position = "none", plot.title = element_blank()), 
+                              fungal.ord.plot + ylim(-1.3, 1.2) + plottheme + theme(legend.position = "none", , plot.title = element_blank()), 
+                              ord.legend, ncol=3, rel_widths = c(1,1,.6), labels = c("a", "b", ""))
+
+y.grob <- grid::textGrob("NMDS 2", gp=grid::gpar(fontsize=12), rot=90)
+
+x.grob <- grid::textGrob("NMDS 1", gp=grid::gpar(fontsize=12))
+
+final_ord.plot = gridExtra::arrangeGrob(ord.plot, left = y.grob, bottom = x.grob)
+
+gridExtra::grid.arrange(final_ord.plot)
+
+#ggsave(plot = final_ord.plot, filename = "/home/sam/notebooks/hemp_microbiome/figures/ordinations.tiff",
+#       device = "tiff", width=7, height=4, units="in")
+```
+
+## Part 2: OTUs of interest
+
+There are a couple ways we can identify OTUs of interest and define a core microbiome. 
+
+For OTUs of interest we can identify the most abundant OTUs across all plants and all fields. As they are in high abundance, it may mean that they are adapted to survive with hemp or plants in general, are being selected for, or are pathogens. It is important to keep in mind that even if the OTU is in high abundance, it may not mean it is doing anything with the plant. It may just be super high abundant in the environment or at least in a certain location. High abundance of a particular OTU could also just be an artifact of the compositional nature of sequencing. In other words, it might have a high relative abundance but there may just be very few microbes there in the first place.
+
+### Bacteria
+
+```{r, message=FALSE, warning=FALSE}
+bact.physeq = transform_sample_counts(physeq16S.bact.rare, function(x) x/sum(x))
+bact.meta = data.frame(sample_data(bact.physeq))
+bact.tax.table = data.frame(gsub("D_.__", "", tax_table(bact.physeq)), stringsAsFactors = FALSE) %>%
+  rownames_to_column(var="OTU")
+bact.OTU.rare.sum = data.frame(otu_table(bact.physeq)) %>%
+  rownames_to_column(var="OTU") %>%
+  gather(key="sample_ID", value="RA", -OTU) %>%
+  mutate(sample_ID = gsub("X", "", gsub("\\.", "-", sample_ID))) %>%
+  left_join(bact.meta, by="sample_ID") %>%
+  group_by(OTU, Sample_type) %>%
+  summarize(mean_RA = mean(RA),
+            sd_RA = sd(RA),
+            min_RA = min(RA),
+            max_RA = max(RA),
+            n_samples = n()) %>%
+  as.data.frame %>%
+  mutate(SE_RA = sd_RA/sqrt(n_samples)) %>%
+  unique() %>%
+  inner_join(bact.tax.table, by="OTU")
+
+bact.OTU.rare.soil = bact.OTU.rare.sum %>%
+  filter(Sample_type == "bulk_soil") %>%
+  dplyr::select(OTU, mean_RA, sd_RA, min_RA, max_RA, n_samples, SE_RA) %>%
+  dplyr::rename(soil_mean_RA = mean_RA, soil_sd_RA = sd_RA, soil_min_RA = min_RA, soil_max_RA = max_RA, soil_n_samples = n_samples, soil_SE_RA = SE_RA)
+
+```
+
+#### Top 5 most abundant OTUS
+
+Here are the top 5 most abundant bacterial OTUs across all plants:
+
+```{r, message=FALSE, warning=FALSE}
+bact.OTU.rare.abd = bact.OTU.rare.sum %>%
+  group_by(Sample_type) %>%
+  top_n(n=5, wt=mean_RA) %>%
+  as.data.frame %>%
+  arrange(Sample_type, -mean_RA) %>%
+  left_join(bact.OTU.rare.soil, by="OTU")
+
+kable(bact.OTU.rare.abd %>%
+        mutate(FC_abd = mean_RA/soil_mean_RA, mean_RA = mean_RA*100, SE_RA = SE_RA*100) %>%
+        mutate(mean_RA = round(mean_RA, 2), SE_RA = round(SE_RA, 2), FC_abd = round(FC_abd, 0)) %>%
+        mutate(compartment = paste(Sample_type, " (", n_samples, ")", sep=""),
+               RA_SE = paste(mean_RA, " (", SE_RA, ")", sep="")) %>%
+        dplyr::select(compartment, OTU, RA_SE, FC_abd, Rank1, Rank2, Rank3, Rank4, Rank5, Rank6, Rank7), "html") %>%
+  kable_styling() %>%
+  scroll_box(width = "100%", height="400px")
+```
+
+Now I'll plot this data.
+
+```{r, message=FALSE, warning=FALSE, fig.width=7, fig.height=3.25}
+bact.OTU.abd4fig = rbind(bact.OTU.rare.abd %>%
+                           filter(Sample_type != "bulk_soil") %>%
+                           mutate(Sample_type = stringr::str_to_sentence(gsub("_", " ", Sample_type)),
+                                  mean_RA = 100*mean_RA,
+                                  SE_RA = 100*SE_RA) %>%
+                           dplyr::select(OTU, Sample_type, mean_RA, SE_RA) %>%
+                           mutate(part = "Plant"),
+                         bact.OTU.rare.abd %>%
+                           filter(Sample_type != "bulk_soil") %>%
+                           mutate(Sample_type = stringr::str_to_sentence(gsub("_", " ", Sample_type)),
+                                  soil_mean_RA = 100*soil_mean_RA,
+                                  soil_SE_RA = 100*soil_SE_RA) %>%
+                           dplyr::select(OTU, Sample_type, soil_mean_RA, soil_SE_RA) %>%
+                           dplyr::rename(mean_RA = soil_mean_RA, SE_RA = soil_SE_RA) %>%
+                           mutate(part = "Bulk Soil")) %>%
+  mutate(part = factor(part, levels=c("Plant", "Bulk Soil")),
+         Sample_type = factor(Sample_type, levels=c("Rhizosphere soil", "Root tissue", "Leaves", "Flowers")))
+                        
+top_bact.plot = ggplot(data=bact.OTU.abd4fig, aes(x=reorder_within(OTU, -mean_RA, Sample_type), fill=part)) +
+  geom_bar(aes(y=mean_RA), stat="identity", color="black", position = "dodge") +
+  geom_errorbar(aes(ymin=mean_RA-SE_RA, ymax=mean_RA+SE_RA), width=0.4, position = position_dodge(width = 0.9)) +
+  labs(x="Top 5 most abundant bacterial OTUs", y="Relative abundance (%)") +
+  scale_fill_manual(values=c("Plant" = "grey", "Bulk soil"="white")) +
+  scale_x_reordered() +
+  theme_bw() +
+  theme(axis.text.x=element_text(size=10, angle=45, hjust=1),
+        axis.text.y=element_text(size=10),
+        axis.title=element_text(size=12),
+        strip.text=element_text(size=12),
+        legend.text=element_text(size=10),
+        legend.title=element_blank(),
+        legend.position = "top") +
+  facet_grid(~Sample_type, scales="free_x")
+
+top_bact.plot
+
+```
+
+#### Ubiquitous OTUs
+
+The bacteria found on all plants are:
+
+```{r, message=FALSE, warning=FALSE}
+bact.physeq = transform_sample_counts(physeq16S.bact, function(x) x/sum(x))
+bact.meta = data.frame(sample_data(bact.physeq))
+bact.tax.table = data.frame(gsub("D_.__", "", tax_table(bact.physeq)), stringsAsFactors = FALSE) %>%
+  rownames_to_column(var="OTU")
+bact.OTU.sum = data.frame(otu_table(bact.physeq)) %>%
+  rownames_to_column(var="OTU") %>%
+  gather(key="sample_ID", value="RA", -OTU) %>%
+  mutate(sample_ID = gsub("X", "", gsub("\\.", "-", sample_ID))) %>%
+  left_join(bact.meta, by="sample_ID") %>%
+  group_by(OTU, Sample_type) %>%
+  summarize(mean_RA = mean(RA),
+            sd_RA = sd(RA),
+            min_RA = min(RA),
+            max_RA = max(RA),
+            n_samples = n()) %>%
+  as.data.frame %>%
+  mutate(SE_RA = sd_RA/sqrt(n_samples)) %>%
+  unique() %>%
+  inner_join(bact.tax.table, by="OTU")
+
+bact.OTU.soil = bact.OTU.sum %>%
+  filter(Sample_type == "bulk_soil") %>%
+  dplyr::select(OTU, mean_RA, sd_RA, min_RA, max_RA, n_samples, SE_RA) %>%
+  dplyr::rename(soil_mean_RA = mean_RA, soil_sd_RA = sd_RA, soil_min_RA = min_RA, soil_max_RA = max_RA, soil_n_samples = n_samples, soil_SE_RA = SE_RA)
+
+bact.OTU.ubiq = bact.OTU.sum %>%
+  filter(min_RA > 0) %>%
+  arrange(Sample_type, -mean_RA)
+
+soil.ubiq = unique(bact.OTU.ubiq[bact.OTU.ubiq$Sample_type == "bulk_soil",]$OTU)
+
+bact.OTU.ubiq = bact.OTU.ubiq %>%
+  filter(Sample_type != "bulk_soil") %>%
+  mutate(Ubiq_in_soil = ifelse(OTU %in% soil.ubiq, "YES", "NO")) %>%
+  left_join(bact.OTU.soil, by="OTU")
+
+kable(bact.OTU.ubiq %>%
+        mutate(FC_abd = mean_RA/soil_mean_RA, mean_RA = mean_RA*100, SE_RA = SE_RA*100) %>%
+        mutate(mean_RA = round(mean_RA, 2), SE_RA = round(SE_RA, 2), FC_abd = round(FC_abd, 0)) %>%
+        mutate(compartment = paste(Sample_type, " (", n_samples, ")", sep=""),
+               RA_SE = paste(mean_RA, " (", SE_RA, ")", sep=""),
+               Ubiq_in_soil = ifelse(Ubiq_in_soil == "YES", "Y", ifelse(Ubiq_in_soil == "NO", "N", NA))) %>%
+        dplyr::select(compartment, OTU, RA_SE, FC_abd, Ubiq_in_soil, Rank1, Rank2, Rank3, Rank4, Rank5, Rank6, Rank7)) %>%
+  kable_styling() %>%
+  scroll_box(width = "100%", height="400px")
+
+```
+
+### Fungi
+
+```{r, message=FALSE, warning=FALSE}
+fungi.physeq = transform_sample_counts(physeqITS.fungi.rare, function(x) x/sum(x))
+fungi.meta = data.frame(sample_data(fungi.physeq))
+fungi.tax.table = data.frame(tax_table(fungi.physeq), stringsAsFactors = FALSE) %>%
+  rownames_to_column(var="OTU")
+
+fungi.OTU.rare.sum = data.frame(otu_table(fungi.physeq)) %>%
+  rownames_to_column(var="OTU") %>%
+  gather(key="sample_ID", value="RA", -OTU) %>%
+  mutate(sample_ID = gsub("X", "", gsub("\\.", "-", sample_ID))) %>%
+  left_join(fungi.meta, by="sample_ID") %>%
+  group_by(OTU, Sample_type) %>%
+  summarize(mean_RA = mean(RA),
+            sd_RA = sd(RA),
+            min_RA = min(RA),
+            max_RA = max(RA),
+            n_samples = n()) %>%
+  as.data.frame %>%
+  mutate(SE_RA = sd_RA/sqrt(n_samples)) %>%
+  unique() %>%
+  inner_join(fungi.tax.table, by="OTU")
+
+fungi.OTU.rare.soil = fungi.OTU.rare.sum %>%
+  filter(Sample_type == "bulk_soil") %>%
+  dplyr::select(OTU, mean_RA, sd_RA, min_RA, max_RA, n_samples, SE_RA) %>%
+  dplyr::rename(soil_mean_RA = mean_RA, soil_sd_RA = sd_RA, soil_min_RA = min_RA, soil_max_RA = max_RA, soil_n_samples = n_samples, soil_SE_RA = SE_RA)
+
+```
+
+#### Top 5 most abundant OTUs
+
+Here are the top 5 most abundant fungal OTUs across all plants:
+
+```{r, message=FALSE, warning=FALSE}
+
+fungi.OTU.rare.abd = fungi.OTU.rare.sum %>%
+  group_by(Sample_type) %>%
+  top_n(n=5, wt=mean_RA) %>%
+  as.data.frame %>%
+  arrange(Sample_type, -mean_RA) %>%
+  left_join(fungi.OTU.rare.soil, by="OTU")
+
+kable(fungi.OTU.rare.abd %>%
+        mutate(FC_abd = mean_RA/soil_mean_RA, mean_RA = mean_RA*100, SE_RA = SE_RA*100) %>%
+        mutate(mean_RA = round(mean_RA, 2), SE_RA = round(SE_RA, 2), FC_abd = round(FC_abd, 0)) %>%
+        mutate(compartment = paste(Sample_type, " (", n_samples, ")", sep=""),
+               RA_SE = paste(mean_RA, " (", SE_RA, ")", sep="")) %>%
+        dplyr::select(compartment, OTU, RA_SE, FC_abd, Kingdom, Phylum, Class, Order, Family, Genus, Species)) %>%
+  kable_styling() %>%
+  scroll_box(width = "100%", height="400px")
+
+```
+
+Now I'll plot this data.
+
+```{r, message=FALSE, warning=FALSE, fig.width=7, fig.height=3.25}
+
+fungi.OTU.abd4fig = rbind(fungi.OTU.rare.abd %>%
+                            filter(Sample_type != "bulk_soil") %>%
+                            mutate(Sample_type = stringr::str_to_sentence(gsub("_", " ", Sample_type)),
+                                   mean_RA = 100*mean_RA,
+                                   SE_RA = 100*SE_RA) %>%
+                            dplyr::select(OTU, Sample_type, mean_RA, SE_RA) %>%
+                            mutate(part = "Plant"),
+                          fungi.OTU.rare.abd %>%
+                            filter(Sample_type != "bulk_soil") %>%
+                            mutate(Sample_type = stringr::str_to_sentence(gsub("_", " ", Sample_type)),
+                                   soil_mean_RA = 100*soil_mean_RA,
+                                   soil_SE_RA = 100*soil_SE_RA) %>%
+                            dplyr::select(OTU, Sample_type, soil_mean_RA, soil_SE_RA) %>%
+                            dplyr::rename(mean_RA = soil_mean_RA, SE_RA = soil_SE_RA) %>%
+                            mutate(part = "Bulk Soil")) %>%
+  mutate(part = factor(part, levels=c("Plant", "Bulk Soil")),
+         Sample_type = factor(Sample_type, levels=c("Rhizosphere soil", "Root tissue", "Leaves", "Flowers")))
+                        
+top_fungi.plot = ggplot(data=fungi.OTU.abd4fig, aes(x=reorder_within(OTU, -mean_RA, Sample_type), fill=part)) +
+  geom_bar(aes(y=mean_RA), stat="identity", color="black", position = "dodge") +
+  geom_errorbar(aes(ymin=mean_RA-SE_RA, ymax=mean_RA+SE_RA), width=0.4, position = position_dodge(width = 0.9)) +
+  labs(x="Top 5 most abundant fungal OTUs", y="Relative abundance (%)") +
+  scale_fill_manual(values=c("Plant" = "grey", "Bulk soil"="white")) +
+  scale_x_reordered() +
+  theme_bw() +
+  theme(axis.text.x=element_text(size=10, angle=45, hjust=1),
+        axis.text.y=element_text(size=10),
+        axis.title=element_text(size=12),
+        strip.text=element_text(size=12),
+        legend.text=element_text(size=10),
+        legend.title=element_blank(),
+        legend.position = "top") +
+  facet_grid(~Sample_type, scales="free_x")
+
+top_fungi.plot
+```
+
+#### Ubiquitous OTUs
+The fungi found on all plants are:
+
+```{r, message=FALSE, warning=FALSE}
+fungi.physeq = transform_sample_counts(physeqITS.fungi, function(x) x/sum(x))
+fungi.meta = data.frame(sample_data(fungi.physeq))
+fungi.tax.table = data.frame(tax_table(fungi.physeq), stringsAsFactors = FALSE) %>%
+  rownames_to_column(var="OTU")
+
+fungi.OTU.sum = data.frame(otu_table(fungi.physeq)) %>%
+  rownames_to_column(var="OTU") %>%
+  gather(key="sample_ID", value="RA", -OTU) %>%
+  mutate(sample_ID = gsub("X", "", gsub("\\.", "-", sample_ID))) %>%
+  left_join(fungi.meta, by="sample_ID") %>%
+  group_by(OTU, Sample_type) %>%
+  summarize(mean_RA = mean(RA),
+            sd_RA = sd(RA),
+            min_RA = min(RA),
+            max_RA = max(RA),
+            n_samples = n()) %>%
+  as.data.frame %>%
+  mutate(SE_RA = sd_RA/sqrt(n_samples)) %>%
+  unique() %>%
+  inner_join(fungi.tax.table, by="OTU")
+
+fungi.OTU.soil = fungi.OTU.sum %>%
+  filter(Sample_type == "bulk_soil") %>%
+  dplyr::select(OTU, mean_RA, sd_RA, min_RA, max_RA, n_samples, SE_RA) %>%
+  dplyr::rename(soil_mean_RA = mean_RA, soil_sd_RA = sd_RA, soil_min_RA = min_RA, soil_max_RA = max_RA, soil_n_samples = n_samples, soil_SE_RA = SE_RA)
+
+fungi.OTU.ubiq = fungi.OTU.sum %>%
+  filter(min_RA > 0) %>%
+  arrange(Sample_type, -mean_RA)
+
+soil.ubiq = unique(fungi.OTU.ubiq[fungi.OTU.ubiq$Sample_type == "bulk_soil",]$OTU)
+
+fungi.OTU.ubiq = fungi.OTU.ubiq %>%
+  filter(Sample_type != "bulk_soil") %>%
+  mutate(Ubiq_in_soil = ifelse(OTU %in% soil.ubiq, "YES", "NO")) %>%
+  left_join(fungi.OTU.soil, by="OTU")
+
+kable(fungi.OTU.ubiq %>%
+        mutate(FC_abd = mean_RA/soil_mean_RA, mean_RA = mean_RA*100, SE_RA = SE_RA*100) %>%
+        mutate(mean_RA = round(mean_RA, 2), SE_RA = round(SE_RA, 2), FC_abd = round(FC_abd, 0)) %>%
+        mutate(compartment = paste(Sample_type, " (", n_samples, ")", sep=""), 
+               RA_SE = paste(mean_RA, " (", SE_RA, ")", sep=""),
+               Ubiq_in_soil = ifelse(Ubiq_in_soil == "YES", "Y", ifelse(Ubiq_in_soil == "NO", "N", NA))) %>%
+        dplyr::select(compartment, OTU, RA_SE, FC_abd, Ubiq_in_soil, Kingdom, Phylum, Class, Order, Family, Genus, Species)) %>%
+  kable_styling() %>%
+  scroll_box(width = "100%", height="400px")
+
+```
+
+### Plot 5 top abunant OTU figures together
+
+```{r, message=FALSE, warning=FALSE, fig.width=7, fig.height=6.5}
+
+top_abd.leg = g_legend(top_fungi.plot)
+
+top_abd.plot = cowplot::plot_grid(top_abd.leg,
+                                  top_bact.plot + theme(legend.position = "none",axis.title = element_blank()),
+                                  top_fungi.plot + theme(legend.position = "none",axis.title = element_blank()), 
+                                  nrow=3, rel_heights = c(0.2,1,1), labels = c("", "a", "b"))
+
+y.grob <- grid::textGrob("Relative abundance (% of reads)", gp=grid::gpar(fontsize=12), rot=90)
+
+x.grob <- grid::textGrob("Top 5 most abundant OTUs", gp=grid::gpar(fontsize=12))
+
+final_top_abd.plot = gridExtra::arrangeGrob(top_abd.plot, left = y.grob, bottom = x.grob)
+
+gridExtra::grid.arrange(final_top_abd.plot)
+
+#ggsave(plot = final_top_abd.plot, filename = "/home/sam/notebooks/hemp_microbiome/figures/top_abd.tiff",
+#       device = "tiff", width=7, height=6.5, units="in")
+```
+
+## Part 3: Significantly enriched OTUs
+
+Now lets use DESeq2 to see if any OTUs are enriched in each of the plant compartments compared to the bulk soil. This might indicate that they are interacting in some way with the hemp plants. I will combine these results with those above to identify the core OTUs. Note that for this step I will be using the unrarefied OTU tables.
+
+### Bacteria
+
+```{r, message=FALSE, warning=FALSE}
+bact.deseq.df = data.frame()
+for (pcomp in c("rhizosphere_soil", "root_tissue", "leaves", "flowers")){
+  # Subset the data to just include bulk soil and plant compartment samples.
+  physeq16S.bact.BSPC = subset_samples(physeq16S.bact, Sample_type %in% c("bulk_soil", pcomp))
+  physeq16S.bact.BSPC = prune_taxa(taxa_sums(physeq16S.bact.BSPC) > 0, physeq16S.bact.BSPC)
+  
+  bact.metadata = data.frame(sample_data(physeq16S.bact.BSPC), stringsAsFactors = F)
+  
+  # Set the sample types as a factor
+  sample_data(physeq16S.bact.BSPC)$Sample_type = factor(sample_data(physeq16S.bact.BSPC)$Sample_type, levels = c("bulk_soil", pcomp))
+  sample_data(physeq16S.bact.BSPC)$Field = as.factor(sample_data(physeq16S.bact.BSPC)$Field)
+  
+  # Get the taxonomy table
+  bact.tax.table = data.frame(gsub("D_.__", "", tax_table(physeq16S.bact.BSPC)), stringsAsFactors = F) %>%
+    rownames_to_column(var="OTU") %>%
+    dplyr::select(OTU, Rank1, Rank2, Rank3, Rank4, Rank5, Rank6, Rank7)
+  colnames(bact.tax.table) = c("OTU", "Domain", "Phylum", "Class", "Order", "Family", "Genus", "Species")
+  
+  # I'll also remove sparse taxa. In this case, taxa must be found with at least a count of 5 in at least 10 samples.
+  OTU.table = as.matrix(otu_table(physeq16S.bact.BSPC))
+  OTU.table[OTU.table < 5] = 0
+  OTU.table[OTU.table >= 5] = 1
+  #sparse = length(sample_names(physeq16S.bact.BSPC)) * 0.25
+  sparse = 1
+  sampleCount.df = data.frame(sample = rowSums(OTU.table)) %>%
+    rownames_to_column(var="OTU") %>%
+    filter(sample >= sparse)
+  physeq16S.bact.BSPC.sparse = prune_taxa(sampleCount.df$OTU, physeq16S.bact.BSPC)
+  
+  # Run DESeq2
+  bact.deseq = phyloseq_to_deseq2(physeq16S.bact.BSPC.sparse, ~ Field + Sample_type)
+  bact.deseq = DESeq(bact.deseq, betaPrior=TRUE)
+  bact.deseq.res = results(bact.deseq, lfcThreshold = .25,
+                      contrast = c("Sample_type", pcomp, "bulk_soil"), 
+                      altHypothesis = "greater",
+                      test="Wald")
+  bact.deseq.df = rbind(bact.deseq.df, data.frame(bact.deseq.res) %>%
+                          rownames_to_column(var="OTU") %>%
+                          mutate(Sample_type = pcomp))
+}
+
+bact.deseq.df = inner_join(bact.deseq.df, bact.tax.table, by="OTU") %>%
+  filter(!(is.na(padj))) %>%
+  arrange(-log2FoldChange) %>%
+  mutate(sig = ifelse(padj < 0.1, Phylum, "not significant"))
+bact.deseq.df$Phylum = factor(bact.deseq.df$Phylum, levels = unique(bact.deseq.df$Phylum))
+
+kable(bact.deseq.df %>% filter(padj < 0.1)) %>%
+  kable_styling() %>%
+  scroll_box(width = "100%", height="400px")
+```
+
+### Fungi
+
+```{r, message=FALSE, warning=FALSE}
+fungi.deseq.df = data.frame()
+for (pcomp in c("rhizosphere_soil", "leaves", "flowers")){
+  # Subset the data to just include bulk soil and plant compartment samples.
+  physeqITS.fungi.BSPC = subset_samples(physeqITS.fungi, Sample_type %in% c("bulk_soil", pcomp))
+  physeqITS.fungi.BSPC = prune_taxa(taxa_sums(physeqITS.fungi.BSPC) > 0, physeqITS.fungi.BSPC)
+  
+  fungi.metadata = data.frame(sample_data(physeqITS.fungi.BSPC), stringsAsFactors = F)
+  
+  # Set the sample types as a factor
+  sample_data(physeqITS.fungi.BSPC)$Sample_type = factor(sample_data(physeqITS.fungi.BSPC)$Sample_type, levels = c("bulk_soil", pcomp))
+  sample_data(physeqITS.fungi.BSPC)$Field = as.factor(sample_data(physeqITS.fungi.BSPC)$Field)
+  
+  # Get the taxonomy table
+  fungi.tax.table = data.frame(gsub("D_.__", "", tax_table(physeqITS.fungi.BSPC)), stringsAsFactors = F) %>%
+    rownames_to_column(var="OTU") %>%
+    dplyr::select(OTU, Kingdom, Phylum, Class, Order, Family, Genus, Species)
+  
+  # I'll also remove sparse taxa. In this case, taxa must be found with at least a count of 5 in at least 10 samples.
+  OTU.table = as.matrix(otu_table(physeqITS.fungi.BSPC))
+  OTU.table[OTU.table < 5] = 0
+  OTU.table[OTU.table >= 5] = 1
+  #sparse = length(sample_names(physeqITS.fungi.BSPC)) * 0.25
+  sparse = 1
+  sampleCount.df = data.frame(sample = rowSums(OTU.table)) %>%
+    rownames_to_column(var="OTU") %>%
+    filter(sample >= sparse)
+  physeqITS.fungi.BSPC.sparse = prune_taxa(sampleCount.df$OTU, physeqITS.fungi.BSPC)
+  
+  # Run DESeq2
+  fungi.deseq = phyloseq_to_deseq2(physeqITS.fungi.BSPC.sparse, ~ Field + Sample_type)
+  fungi.deseq = DESeq(fungi.deseq, betaPrior=TRUE)
+  fungi.deseq.res = results(fungi.deseq, lfcThreshold = .25,
+                      contrast = c("Sample_type", pcomp, "bulk_soil"), 
+                      altHypothesis = "greater",
+                      test="Wald")
+  fungi.deseq.df = rbind(fungi.deseq.df, data.frame(fungi.deseq.res) %>%
+                          rownames_to_column(var="OTU") %>%
+                          mutate(Sample_type = pcomp))
+}
+
+fungi.deseq.df = inner_join(fungi.deseq.df, fungi.tax.table, by="OTU") %>%
+  filter(!(is.na(padj))) %>%
+  arrange(-log2FoldChange) %>%
+  mutate(sig = ifelse(padj <= 0.1, Phylum, "not significant"))
+fungi.deseq.df$Phylum = factor(fungi.deseq.df$Phylum, levels = unique(fungi.deseq.df$Phylum))
+
+kable(fungi.deseq.df %>% filter(padj < 0.1)) %>%
+  kable_styling() %>%
+  scroll_box(width = "100%", height="400px")
+```
+
+## Part 4: Core OTUs
+
+For defining the core microbiome we can find OTUs that are present on all plants. Again this might mean that they are just super abundant in the environment though. Then we can narrow this list by seeing which OTUs are enriched on the plant compartment compared to the bulk soil. This would suggest that, while they may be found in the soil, as this might be the source of the microbiome, they may be more associated with the plant.
+
+In part 2 and 3 we found the ubiquitous OTUs and the significantly enriched OTUs respectively. So lets now merge the data together to identify the Core OTUs. Also lets still include the top 5 most abundant OTUs.
+
+### Bacteria
+
+```{r, message=FALSE, warning=FALSE}
+## Get the ubiqitous OTUs and whether they are CORE or not (significantly enriched)
+bact.ubiq = bact.OTU.ubiq %>%
+  mutate(Ubiq_in_plant = "YES") %>%
+  dplyr::select(Sample_type, OTU, Ubiq_in_plant)
+bact.enr = bact.deseq.df %>% 
+  dplyr::select(Sample_type, OTU, log2FoldChange, lfcSE, padj)
+  
+## Whether OTUS are ubiquitous in the bulk soil
+bact.OTU.soil.ubiq = bact.OTU.sum %>%
+  filter(Sample_type == "bulk_soil") %>%
+  mutate(Ubiq_in_soil = ifelse(min_RA > 0, "YES", "NO")) %>%
+  dplyr::select(OTU, Ubiq_in_soil)
+
+## Final table of OTUS of interest including CORE
+bact.OTU.interest = bact.OTU.rare.sum %>%
+  arrange(-mean_RA) %>%
+  group_by(Sample_type) %>%
+  mutate(RA_Rank = row_number()) %>%
+  ungroup() %>%
+  dplyr::select(Sample_type, OTU, mean_RA, SE_RA, RA_Rank, Rank1, Rank2, Rank3, Rank4, Rank5, Rank6, Rank7) %>%
+  full_join(bact.OTU.soil.ubiq, by="OTU") %>%
+  full_join(bact.ubiq, by=c("Sample_type", "OTU")) %>%
+  full_join(bact.enr, by=c("Sample_type", "OTU")) %>%
+  mutate(Ubiq_in_plant = ifelse(is.na(Ubiq_in_plant), "NO", Ubiq_in_plant),
+         Core = ifelse(Ubiq_in_plant == "YES" & padj < 0.1, "YES", "NO"),
+         mean_RA = mean_RA*100,
+         SE_RA = SE_RA*100,
+         log2FoldChange = ifelse(padj > 0.1, NA, log2FoldChange),
+         lfcSE = ifelse(padj > 0.1, NA, lfcSE)) %>%
+  filter(RA_Rank <= 5 | Core == "YES") %>%
+  dplyr::select(Sample_type, OTU, mean_RA, SE_RA, log2FoldChange, lfcSE, RA_Rank, Ubiq_in_plant, Ubiq_in_soil, Core, Rank1, Rank2, Rank3, Rank4, Rank5, Rank6, Rank7) %>%
+  dplyr::rename(Domain=Rank1, Phylum=Rank2, Class=Rank3, Order=Rank4, Family=Rank5, Genus=Rank6, Species=Rank7) %>%
+  mutate(Sample_type = factor(Sample_type, levels = c("bulk_soil", "rhizosphere_soil", "root_tissue", "leaves", "flowers"))) %>%
+  arrange(Sample_type, RA_Rank)
+
+kable(bact.OTU.interest %>%
+        mutate(RA = paste(round(mean_RA, digits = 2), " (", round(SE_RA, digits = 2), ")", sep=""),
+        log2FC = paste(round(log2FoldChange, digits = 2), " (", round(lfcSE, digits = 2), ")", sep="")) %>%
+  dplyr::select(Sample_type, OTU, RA, log2FC, RA_Rank, Ubiq_in_plant, Ubiq_in_soil, Core, Domain, Phylum, Class, Order, Family, Genus, Species)) %>%
+  kable_styling() %>%
+  scroll_box(width = "100%", height="400px")
+
+```
+
+### Fungi
+
+```{r, message=FALSE, warning=FALSE}
+## Get the ubiqitous OTUs and whether they are CORE or not (significantly enriched)
+fungi.ubiq = fungi.OTU.ubiq %>%
+  mutate(Ubiq_in_plant = "YES") %>%
+  dplyr::select(Sample_type, OTU, Ubiq_in_plant)
+fungi.enr = fungi.deseq.df %>% 
+  dplyr::select(Sample_type, OTU, log2FoldChange, lfcSE, padj)
+  
+## Whether OTUS are ubiquitous in the bulk soil
+fungi.OTU.soil.ubiq = fungi.OTU.sum %>%
+  filter(Sample_type == "bulk_soil") %>%
+  mutate(Ubiq_in_soil = ifelse(min_RA > 0, "YES", "NO")) %>%
+  dplyr::select(OTU, Ubiq_in_soil)
+
+## Final table of OTUS of interest including CORE
+fungi.OTU.interest = fungi.OTU.rare.sum %>%
+  arrange(-mean_RA) %>%
+  group_by(Sample_type) %>%
+  mutate(RA_Rank = row_number()) %>%
+  ungroup() %>%
+  dplyr::select(Sample_type, OTU, mean_RA, SE_RA, RA_Rank, Kingdom, Phylum, Class, Order, Family, Genus, Species) %>%
+  full_join(fungi.OTU.soil.ubiq, by="OTU") %>%
+  full_join(fungi.ubiq, by=c("Sample_type", "OTU")) %>%
+  full_join(fungi.enr, by=c("Sample_type", "OTU")) %>%
+  filter(RA_Rank <= 5 | Ubiq_in_plant == "YES") %>%
+   mutate(Ubiq_in_plant = ifelse(is.na(Ubiq_in_plant), "NO", Ubiq_in_plant),
+         Core = ifelse(Ubiq_in_plant == "YES" & padj < 0.1, "YES", "NO"),
+         mean_RA = mean_RA*100,
+         SE_RA = SE_RA*100,
+         log2FoldChange = ifelse(padj > 0.1, NA, log2FoldChange),
+         lfcSE = ifelse(padj > 0.1, NA, lfcSE)) %>%
+  filter(RA_Rank <= 5 | Core == "YES") %>%
+  dplyr::select(Sample_type, OTU, mean_RA, SE_RA, log2FoldChange, lfcSE, RA_Rank, Ubiq_in_plant, Ubiq_in_soil, Core, Kingdom, Phylum, Class, Order, Family, Genus, Species) %>%
+  mutate(Sample_type = factor(Sample_type, levels = c("bulk_soil", "rhizosphere_soil", "root_tissue", "leaves", "flowers"))) %>%
+  arrange(Sample_type, RA_Rank)
+
+kable(fungi.OTU.interest %>%
+        mutate(RA = paste(round(mean_RA, digits = 2), " (", round(SE_RA, digits = 2), ")", sep=""),
+               log2FC = paste(round(log2FoldChange, digits = 2), " (", round(lfcSE, digits = 2), ")", sep="")) %>%
+  dplyr::select(Sample_type, OTU, RA, log2FC, RA_Rank, Ubiq_in_plant, Ubiq_in_soil, Core, Kingdom, Phylum, Class, Order, Family, Genus, Species)) %>%
+  kable_styling() %>%
+  scroll_box(width = "100%", height="400px")
+
+```
+
+## Part 5: Crop yeild correlations
+
+While we dont have yeild measures for each individual plants we do have them for the entire field. To see if there is any connection between the microbiomes and the hemp yeild lets try to find a correlation between the difference in grain yeild between fields and the community distance (Bray-Curtis).
+
+### Bacteria
+
+```{r, message=FALSE, warning=FALSE, fig.height=4, fig.width=4}
+for (plant_part in c("rhizosphere_soil", "root_tissue", "leaves", "flowers")){
+  writeLines(paste("Running", plant_part, "\n", sep=" "))
+  # Subset phyloseq
+  physeq.sub = subset_samples(physeq16S.bact, Sample_type == plant_part & Field != "Freeville")
+  
+  # Remove fields with fewer than 3 replicates
+  rep.n = data.frame(sample_data(physeq.sub), stringsAsFactors = F) %>%
+    group_by(Field) %>%
+    mutate(N = n()) %>%
+    ungroup
+  physeq.sub = prune_samples(rep.n[rep.n$N >= 3,]$sample_ID, physeq.sub)
+  writeLines(paste("Removed fields:", unique(rep.n[rep.n$N < 3,]$Field)))
+  
+  # rarefy and normalize counts
+  set.seed(72)
+  physeq.sub = rarefy_even_depth(physeq.sub)
+  physeq.sub = transform_sample_counts(physeq.sub, function(x) x / sum(x))
+  
+  # get sample metadata and split into 2 similar dataframes for contrasts
+  metadata = data.frame(sample_data(physeq.sub), stringsAsFactors = F)
+  meta1 = metadata %>%
+    dplyr::select(sample_ID, Field)
+  colnames(meta1) = c("sample1", "field1")
+  meta2 = metadata %>%
+    dplyr::select(sample_ID, Field)
+  colnames(meta2) = c("sample2", "field2")
+  
+  # Calculate pairwise Bray-Curtis distances and add metadata
+  BC.dist = data.frame(as.matrix(phyloseq::distance(physeq.sub, method="bray")))
+  colnames(BC.dist) = gsub("X", "", gsub("\\.", "-", colnames(BC.dist)))
+  dist.df = BC.dist %>%
+    rownames_to_column(var="sample1") %>%
+    gather(key="sample2", value="BC_dist", -sample1) %>%
+    filter(sample1 != sample2) %>%
+    mutate(contrast = paste(pmin(sample1, sample2), pmax(sample1, sample2), sep="+")) %>%
+    separate(contrast, into=c("sample1", "sample2"), sep="\\+", remove=F) %>%
+    unique() %>%
+    inner_join(meta1) %>%
+    inner_join(meta2) %>%
+    filter(field1 != field2) %>%
+    group_by(field1, field2) %>%
+    summarize(mean_BC = mean(BC_dist),
+              sd_BC = sd(BC_dist),
+              n.con = n())
+  
+  # Add field data
+  field.diff1 = field.data %>%
+    dplyr::select(Field, Clean_Grain_Yield)
+  colnames(field.diff1) = c("field1", "CGY1")
+  field.diff2 = field.data %>%
+    dplyr::select(Field, Clean_Grain_Yield)
+  colnames(field.diff2) = c("field2", "CGY2")
+  
+  dist.field.df = inner_join(dist.df, field.diff1, by="field1")
+  dist.field.df = inner_join(dist.field.df, field.diff2, by="field2")
+  dist.field.df = dist.field.df %>%
+    mutate(CGY_diff = abs(CGY1-CGY2))
+  
+  # Calculate correlation coeficient
+  writeLines("Correlation analysis between mean Bray-Curtis dissimilarity and difference in clean grain yield")
+  corr = cor.test(dist.field.df$mean_BC, dist.field.df$CGY_diff, method = "pearson", conf.level = 0.95)
+  print(corr)
+  writeLines(paste("Adjusted pvalue =", p.adjust(corr$p.value, method="bonferroni", n=4), "\n"))
+  
+  # Plot
+  title = paste(plant_part, ":", " r=", round(corr$estimate, digits=5), ", df=", corr$parameter, ", p=", round(p.adjust(corr$p.value, method="bonferroni", n=4), digits=5), sep="")
+  dist.field.plot = ggplot(data=dist.field.df, aes(x=mean_BC, y=CGY_diff)) +
+    geom_point() +
+    geom_smooth(method="lm") +
+    labs(x="Mean Bray-Curtis dissimilarity", y="Difference in clean grain yield") +
+    ggtitle(label = title) +
+    theme_bw()
+  
+  plot(dist.field.plot)
+  
+}
+```
+
+### Fungi
+
+```{r, message=FALSE, warning=FALSE, fig.height=4, fig.width=4}
+for (plant_part in c("rhizosphere_soil", "leaves", "flowers")){
+  writeLines(paste("Running", plant_part, "\n", sep=" "))
+  # Subset phyloseq
+  physeq.sub = subset_samples(physeqITS.fungi, Sample_type == plant_part & Field != "Freeville")
+  
+  # Remove fields with fewer than 3 replicates
+  rep.n = data.frame(sample_data(physeq.sub), stringsAsFactors = F) %>%
+    group_by(Field) %>%
+    mutate(N = n()) %>%
+    ungroup
+  physeq.sub = prune_samples(rep.n[rep.n$N >= 3,]$sample_ID, physeq.sub)
+  writeLines(paste("Removed fields:", unique(rep.n[rep.n$N < 3,]$Field)))
+  
+  # rarefy and normalize counts
+  set.seed(72)
+  physeq.sub = rarefy_even_depth(physeq.sub)
+  physeq.sub = transform_sample_counts(physeq.sub, function(x) x / sum(x))
+  
+  # get sample metadata and split into 2 similar dataframes for contrasts
+  metadata = data.frame(sample_data(physeq.sub), stringsAsFactors = F)
+  meta1 = metadata %>%
+    dplyr::select(sample_ID, Field)
+  colnames(meta1) = c("sample1", "field1")
+  meta2 = metadata %>%
+    dplyr::select(sample_ID, Field)
+  colnames(meta2) = c("sample2", "field2")
+  
+  # Calculate pairwise Bray-Curtis distances and add metadata
+  BC.dist = data.frame(as.matrix(phyloseq::distance(physeq.sub, method="bray")))
+  colnames(BC.dist) = gsub("X", "", gsub("\\.", "-", colnames(BC.dist)))
+  dist.df = BC.dist %>%
+    rownames_to_column(var="sample1") %>%
+    gather(key="sample2", value="BC_dist", -sample1) %>%
+    filter(sample1 != sample2) %>%
+    mutate(contrast = paste(pmin(sample1, sample2), pmax(sample1, sample2), sep="+")) %>%
+    separate(contrast, into=c("sample1", "sample2"), sep="\\+", remove=F) %>%
+    unique() %>%
+    inner_join(meta1) %>%
+    inner_join(meta2) %>%
+    filter(field1 != field2) %>%
+    group_by(field1, field2) %>%
+    summarize(mean_BC = mean(BC_dist),
+              sd_BC = sd(BC_dist),
+              n.con = n())
+  
+  # Add field data
+  field.diff1 = field.data %>%
+    dplyr::select(Field, Clean_Grain_Yield)
+  colnames(field.diff1) = c("field1", "CGY1")
+  field.diff2 = field.data %>%
+    dplyr::select(Field, Clean_Grain_Yield)
+  colnames(field.diff2) = c("field2", "CGY2")
+  
+  dist.field.df = inner_join(dist.df, field.diff1, by="field1")
+  dist.field.df = inner_join(dist.field.df, field.diff2, by="field2")
+  dist.field.df = dist.field.df %>%
+    mutate(CGY_diff = abs(CGY1-CGY2))
+  
+  # Calculate correlation coeficient
+  writeLines("Correlation analysis between mean Bray-Curtis dissimilarity and difference in clean grain yield")
+  corr = cor.test(dist.field.df$mean_BC, dist.field.df$CGY_diff, method = "pearson", conf.level = 0.95)
+  print(corr)
+  writeLines(paste("Adjusted pvalue =", p.adjust(corr$p.value, method="bonferroni", n=3), "\n"))
+  
+  # Plot
+  title = paste(plant_part, ":", " r=", round(corr$estimate, digits=5), ", df=", corr$parameter, ", p=", round(p.adjust(corr$p.value, method="bonferroni", n=3), digits=5), sep="")
+  dist.field.plot = ggplot(data=dist.field.df, aes(x=mean_BC, y=CGY_diff)) +
+    geom_point() +
+    geom_smooth(method="lm") +
+    labs(x="Mean Bray-Curtis dissimilarity", y="Difference in clean grain yield") +
+    ggtitle(label = title) +
+    theme_bw()
+  
+  plot(dist.field.plot)
+  
+}
+```
+
+## Session info
+```{r}
+sessionInfo()
+```
+

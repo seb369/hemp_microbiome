@@ -1,0 +1,7 @@
+Field	Grain_Yield	Clean_Grain_Yield
+McGowan	2538.9	2340.8
+McGowan_Late	1734.6	1608.6
+East_Ithaca	605.8	582.2
+Freeville	NA	NA
+Blight	843.3	780.27
+Research_North	669.2	624.22
